@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stopky + GPS + Mapa</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin: 0; background: #0b0f14; color: #e7eef6; font-family: system-ui, sans-serif; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 16px; }
+    .card { background: #121822; border-radius: 12px; padding: 16px; margin: 12px 0; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    input, button { width: 100%; padding: 10px; margin-top: 4px; border-radius: 8px; border: none; font-size: 1rem; }
+    button { background-color: #1a2533; color: white; }
+    button.primary { background-color: #1e804f; }
+    button.warn { background-color: #7a1b21; }
+    #map { height: 300px; width: 100%; margin-top: 8px; border-radius: 8px; }
+    .mono { font-family: monospace; }
+    .log { background: #0f141c; border: 1px dashed #2b3b51; border-radius: 12px; padding: 12px; max-height: 200px; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>⏱️ Stopky + 📍GPS + 🗺️ Mapa</h2>
+
+    <!-- Nastavenia -->
+    <div class="card">
+      <div class="row">
+        <div>
+          <label>Plánovaný štart (voliteľné)</label>
+          <input id="startTime" type="datetime-local" />
+        </div>
+        <div>
+          <label>Auto-stop polomer (m)</label>
+          <input id="autoStop" type="number" value="25" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Cieľ – šírka (lat)</label>
+          <input id="lat" type="number" step="any" placeholder="48.1486" />
+        </div>
+        <div>
+          <label>Cieľ – dĺžka (lon)</label>
+          <input id="lon" type="number" step="any" placeholder="17.1077" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Max. chyba GPS (m)</label>
+          <input id="minAcc" type="number" value="35" />
+        </div>
+        <div>
+          <label>Vzorkovanie (ms)</label>
+          <input id="sampling" type="number" value="1000" />
+        </div>
+      </div>
+      <div class="row">
+        <button id="btnStart" class="primary">Štart</button>
+        <button id="btnStop" class="warn" disabled>Stop</button>
+        <button id="btnReset">Reset</button>
+        <button id="btnCopy">Kopírovať JSON</button>
+      </div>
+    </div>
+
+    <!-- Výstupy -->
+    <div class="card">
+      <p><b>Stav:</b> <span id="status" class="mono">pripravené</span></p>
+      <p><b>Elapsed:</b> <span id="elapsed" class="mono">00:00.000</span></p>
+      <p><b>Štart (UTC):</b> <span id="startUTC" class="mono">—</span></p>
+      <p><b>Koniec (UTC):</b> <span id="endUTC" class="mono">—</span></p>
+      <p><b>Poloha:</b> <span id="pos" class="mono">—</span></p>
+      <p><b>Vzdialenosť do cieľa:</b> <span id="dist" class="mono">—</span> m <span id="distok"></span></p>
+      <div id="map"></div>
+    </div>
+
+    <div class="card">
+      <p><b>Log:</b></p>
+      <div id="log" class="log"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const el = id => document.getElementById(id);
+    const log = msg => {
+      const t = new Date().toISOString();
+      el("log").textContent = "[" + t + "] " + msg + "\n" + el("log").textContent;
+    };
+
+    const distMeters = (lat1, lon1, lat2, lon2) => {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    };
+
+    let running = false;
+    let startWallUtc = null, startMono = null, endWallUtc = null, endMono = null;
+    let watchId = null, timerId = null, trace = [];
+
+    const fmtElapsed = ms => {
+      const mm = Math.floor(ms/60000);
+      const ss = Math.floor((ms%60000)/1000);
+      const ms3 = Math.floor(ms%1000);
+      return String(mm).padStart(2,'0')+':'+String(ss).padStart(2,'0')+'.'+String(ms3).padStart(3,'0');
+    };
+
+    // Leaflet mapa a vrstvy
+    const map = L.map('map').setView([48.1486, 17.1077], 16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+    const pathLayer = L.polyline([], { color: 'blue', weight: 4 }).addTo(map);
+    const marker = L.circleMarker([0,0], {
+      radius: 8, color: 'red', fillColor: 'red', fillOpacity: 0.9
+    }).addTo(map);
+
+    const onPosition = pos => {
+      const c = pos.coords;
+      const nowWall = Date.now();
+      const nowMono = performance.now();
+      const lat = c.latitude;
+      const lon = c.longitude;
+      const acc = c.accuracy;
+      el("pos").textContent = `lat:${lat.toFixed(6)}, lon:${lon.toFixed(6)}, acc:${acc}m`;
+
+      const tgtLat = parseFloat(el("lat").value);
+      const tgtLon = parseFloat(el("lon").value);
+      if (!isNaN(tgtLat) && !isNaN(tgtLon)) {
+        const d = distMeters(lat, lon, tgtLat, tgtLon);
+        el("dist").textContent = d.toFixed(1);
+        const ok = (d <= Number(el("autoStop").value||25)) && (acc <= Number(el("minAcc").value||35));
+        el("distok").textContent = ok ? "✅" : "";
+        if (running && ok) finish("auto-stop: cieľ dosiahnutý");
+      }
+
+      if (running) {
+        const pt = [lat, lon];
+        trace.push({t_wall:new Date(nowWall).toISOString(), t_mono:nowMono-startMono, lat, lon, acc});
+        pathLayer.addLatLng(pt);
+        marker.setLatLng(pt);
+        map.panTo(pt);
+      }
+    };
+
+    const onError = err => log("GPS chyba: " + err.message);
+
+    const begin = () => {
+      if (running) return;
+      running = true;
+      startWallUtc = Date.now();
+      startMono = performance.now();
+      trace = [];
+      el("startUTC").textContent = new Date(startWallUtc).toISOString();
+      el("status").textContent = "beží";
+      el("btnStart").disabled = true;
+      el("btnStop").disabled = false;
+      timerId = setInterval(() => el("elapsed").textContent = fmtElapsed(performance.now() - startMono), 50);
+      watchId = navigator.geolocation.watchPosition(onPosition, onError, { enableHighAccuracy: true });
+      log("Štart");
+    };
+
+    const finish = (reason = "manuálne Stop") => {
+      if (!running) return;
+      running = false;
+      endWallUtc = Date.now();
+      endMono = performance.now();
+      el("endUTC").textContent = new Date(endWallUtc).toISOString();
+      el("elapsed").textContent = fmtElapsed(endMono - startMono);
+      el("status").textContent = "ukončené";
+      el("btnStart").disabled = false;
+      el("btnStop").disabled = true;
+      clearInterval(timerId);
+      navigator.geolocation.clearWatch(watchId);
+      log("Stop: " + reason);
+    };
+
+    const resetAll = () => {
+      running = false;
+      clearInterval(timerId);
+      navigator.geolocation.clearWatch(watchId);
+      el("elapsed").textContent = "00:00.000";
+      el("startUTC").textContent = "—";
+      el("endUTC").textContent = "—";
+      el("status").textContent = "pripravené";
+      el("btnStart").disabled = false;
+      el("btnStop").disabled = true;
+      el("log").textContent = "";
+      el("dist").textContent = "—";
+      el("distok").textContent = "";
+      pathLayer.setLatLngs([]);
+      trace = [];
+      log("Reset");
+    };
+
+    const getPayload = () => ({
+      start_wall: new Date(startWallUtc).toISOString(),
+      end_wall: new Date(endWallUtc).toISOString(),
+      elapsed_ms: Math.round(endMono - startMono),
+      samples: trace
+    });
+
+    el("btnStart").onclick = () => {
+      const dt = el("startTime").value;
+      if (dt) {
+        const when = new Date(dt).getTime();
+        const delay = Math.max(0, when - Date.now());
+        log("Naplánované spustenie o " + Math.round(delay / 1000) + "s");
+        setTimeout(begin, delay);
+      } else begin();
+    };
+    el("btnStop").onclick = () => finish("manuálne");
+    el("btnReset").onclick = resetAll;
+    el("btnCopy").onclick = async () => {
+      const json = JSON.stringify(getPayload(), null, 2);
+      try {
+        await navigator.clipboard.writeText(json);
+        log("JSON skopírovaný");
+      } catch {
+        const blob = new Blob([json], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "meranie.json"; a.click();
+        URL.revokeObjectURL(url);
+        log("Stiahnutý meranie.json");
+      }
+    };
+  </script>
+</body>
+</html>
