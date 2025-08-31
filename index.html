@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stopky GPS Mapa</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#1e804f" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { font-family: sans-serif; padding: 1rem; background: #f2f2f2; }
+    .card { background: white; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
+    .mono { font-family: monospace; }
+    #map { height: 300px; width: 100%; }
+    button { margin-right: 5px; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <h2>GPS Stopky + Mapa</h2>
+
+  <div class="card">
+    <button id="btnStart">Štart</button>
+    <button id="btnStop">Stop</button>
+    <button id="btnReset">Reset</button>
+    <button id="btnCopy">Kopírovať JSON</button>
+    <button id="btnCSV">Stiahnuť CSV</button>
+    <p><b>Čas:</b> <span id="elapsed" class="mono">0.000 s</span></p>
+    <p><b>Rýchlosť:</b> <span id="speed" class="mono">—</span></p>
+    <p><b>Výška:</b> <span id="alt" class="mono">—</span></p>
+    <p><b>Presnosť:</b> <span id="acc" class="mono">—</span></p>
+  </div>
+
+  <div class="card">
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const el = id => document.getElementById(id);
+    const log = msg => console.log("[GPS]", msg);
+
+    let startTime = null;
+    let timerInterval = null;
+    let trace = [];
+    let watcher = null;
+
+    const map = L.map('map').setView([48.1486, 17.1077], 16);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    const tracePath = L.polyline([], { color: 'blue' }).addTo(map);
+    const positionMarker = L.circleMarker([0, 0], {
+      radius: 8, color: 'red', fillColor: 'red', fillOpacity: 0.9
+    }).addTo(map);
+
+    function updateTime() {
+      const now = performance.now();
+      const elapsed = ((now - startTime) / 1000).toFixed(3);
+      el("elapsed").textContent = elapsed + " s";
+    }
+
+    function onPosition(pos) {
+      const c = pos.coords;
+      const now = new Date().toISOString();
+      const mono = performance.now();
+      trace.push({ t_wall: now, t_mono: mono, lat: c.latitude, lon: c.longitude, acc: c.accuracy });
+      tracePath.addLatLng([c.latitude, c.longitude]);
+      positionMarker.setLatLng([c.latitude, c.longitude]);
+      map.panTo([c.latitude, c.longitude]);
+      el("acc").textContent = c.accuracy.toFixed(1) + " m";
+      if (c.altitude != null) el("alt").textContent = c.altitude.toFixed(1) + " m";
+      if (c.speed != null) el("speed").textContent = (c.speed * 3.6).toFixed(1) + " km/h";
+    }
+
+    function startTracking() {
+      startTime = performance.now();
+      timerInterval = setInterval(updateTime, 100);
+      trace = [];
+      watcher = navigator.geolocation.watchPosition(onPosition, err => log("Chyba GPS: " + err.message), {
+        enableHighAccuracy: true, maximumAge: 1000, timeout: 10000
+      });
+    }
+
+    function stopTracking() {
+      clearInterval(timerInterval);
+      navigator.geolocation.clearWatch(watcher);
+    }
+
+    el("btnStart").onclick = startTracking;
+    el("btnStop").onclick = stopTracking;
+    el("btnReset").onclick = () => {
+      stopTracking();
+      trace = [];
+      tracePath.setLatLngs([]);
+      el("elapsed").textContent = "0.000 s";
+    };
+
+    el("btnCopy").onclick = () => {
+      const text = JSON.stringify(trace, null, 2);
+      navigator.clipboard.writeText(text).then(() => log("Dáta skopírované."));
+    };
+
+    el("btnCSV").onclick = () => {
+      if (!trace.length) return;
+      const header = "t_wall_utc,t_mono_ms,lat,lon,accuracy_m\n";
+      const rows = trace.map(p => [p.t_wall, Math.round(p.t_mono), p.lat, p.lon, p.acc].join(","));
+      const csv = header + rows.join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "meranie.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./service-worker.js')
+        .then(() => log("✅ Service worker registrovaný"))
+        .catch(err => log("❌ Service worker error: " + err));
+    }
+  </script>
+</body>
+</html>
